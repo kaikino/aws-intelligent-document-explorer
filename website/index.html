@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>File Explorer</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .upload-area { border: 2px dashed #ccc; padding: 20px; text-align: center; margin-bottom: 20px; }
+        .file-list { margin-top: 20px; }
+        .file-item { border: 1px solid #ddd; padding: 10px; margin: 5px 0; }
+        .summary { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>File Explorer</h1>
+    
+    <div class="upload-area">
+        <input type="file" id="fileInput" multiple>
+        <button onclick="uploadFiles()">Upload Files</button>
+    </div>
+    
+    <div class="file-list" id="fileList">
+        <h3>Processed Files</h3>
+        <div id="files"></div>
+    </div>
+
+    <script>
+        const API_ENDPOINT = 'REPLACE_WITH_API_GATEWAY_URL';
+
+        async function uploadFiles() {
+            const files = document.getElementById('fileInput').files;
+            for (let file of files) {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                try {
+                    const response = await fetch(`${API_ENDPOINT}/upload`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    console.log('Uploaded:', file.name);
+                } catch (error) {
+                    console.error('Upload failed:', error);
+                }
+            }
+            setTimeout(loadFiles, 3000);
+        }
+
+        async function loadFiles() {
+            try {
+                const response = await fetch(`${API_ENDPOINT}/files`);
+                const data = await response.json();
+                displayFiles(data.files);
+            } catch (error) {
+                console.error('Failed to load files:', error);
+                displayFiles([]);
+            }
+        }
+
+        function displayFiles(files) {
+            const filesDiv = document.getElementById('files');
+            if (files.length === 0) {
+                filesDiv.innerHTML = '<p>No files processed yet.</p>';
+                return;
+            }
+            
+            filesDiv.innerHTML = files.map(file => `
+                <div class="file-item">
+                    <strong>${file.Name}</strong><br>
+                    Type: ${file.FileType} | Size: ${formatSize(file.FileSize)} | Uploaded: ${formatDate(file.DateUploaded)}<br>
+                    <div class="summary">Summary: ${file.Summary || 'Processing...'}</div>
+                </div>
+            `).join('');
+        }
+
+        function formatSize(bytes) {
+            return bytes ? (bytes / 1024 / 1024).toFixed(1) + 'MB' : 'Unknown';
+        }
+
+        function formatDate(dateStr) {
+            return dateStr ? new Date(dateStr).toLocaleDateString() : 'Unknown';
+        }
+
+        loadFiles();
+        setInterval(loadFiles, 3000); // Refresh every 10 seconds
+    </script>
+</body>
+</html>

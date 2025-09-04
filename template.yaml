@@ -1,0 +1,720 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Intelligent Document Explorer - A serverless document processing platform that automatically extracts text, generates summaries, and analyzes content from uploaded documents using AWS AI services. 
+  Features intelligent workflow orchestration with Step Functions, automatic fallback mechanisms, and support for multiple file formats. (uksb-1tthgi812) (tag:textract-lambda-sam-python)
+
+Resources:
+  # S3 bucket to store Image files from the user.
+  ImageFileBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ['*']
+            ExposedHeaders: [ETag]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 bucket for website hosting
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # Website deployment function
+  WebsiteDeployFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref WebsiteBucket
+      InlineCode: |
+        import boto3
+        import cfnresponse
+        def handler(event, context):
+            s3 = boto3.client('s3')
+            bucket = event['ResourceProperties']['Bucket']
+            api_url = event['ResourceProperties']['ApiUrl']
+            html = f'''<!DOCTYPE html>
+        <html><head><title>Document Processing Dashboard</title>
+        <style>body{{font-family:Arial,sans-serif;margin:20px}}.upload-area{{border:2px dashed #ccc;padding:20px;text-align:center;margin-bottom:20px}}.file-list{{margin-top:20px}}.file-item{{border:1px solid #ddd;padding:10px;margin:5px 0}}.summary{{color:#666;font-style:italic}}</style></head>
+        <body><h1>Document Processing Dashboard</h1>
+        <div class="upload-area"><input type="file" id="fileInput" multiple><button onclick="uploadFiles()">Upload Files</button></div>
+        <div class="file-list"><h3>Processed Files</h3><div id="files"></div></div>
+        <script>const API_ENDPOINT='{api_url}';async function uploadFiles(){{const files=document.getElementById('fileInput').files;for(let file of files){{const formData=new FormData();formData.append('file',file);try{{await fetch(`${{API_ENDPOINT}}/upload`,{{method:'POST',body:formData}});console.log('Uploaded:',file.name);}}catch(error){{console.error('Upload failed:',error);}}}}setTimeout(loadFiles,3000);}}async function loadFiles(){{try{{const response=await fetch(`${{API_ENDPOINT}}/files`);const data=await response.json();displayFiles(data.files);}}catch(error){{displayFiles([]);}}}}function displayFiles(files){{const filesDiv=document.getElementById('files');if(files.length===0){{filesDiv.innerHTML='<p>No files processed yet.</p>';return;}}filesDiv.innerHTML=files.map(file=>`<div class="file-item"><strong>${{file.Name}}</strong><br>Type: ${{file.FileType}} | Size: ${{formatSize(file.FileSize)}} | Uploaded: ${{formatDate(file.DateUploaded)}}<br><div class="summary">Summary: ${{file.Summary||'Processing...'}}</div></div>`).join('');}}function formatSize(bytes){{return bytes?(bytes/1024/1024).toFixed(1)+'MB':'Unknown';}}function formatDate(dateStr){{return dateStr?new Date(dateStr).toLocaleDateString():'Unknown';}}loadFiles();setInterval(loadFiles,10000);</script></body></html>'''
+            try:
+                if event['RequestType'] == 'Delete':
+                    s3.delete_object(Bucket=bucket, Key='index.html')
+                else:
+                    s3.put_object(Bucket=bucket, Key='index.html', Body=html, ContentType='text/html')
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+
+  # Deploy website
+  WebsiteDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt WebsiteDeployFunction.Arn
+      Bucket: !Ref WebsiteBucket
+      ApiUrl: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+
+
+
+  # Define the DynamoDB table
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "Name"
+          AttributeType: "S"
+        - AttributeName: "Bucket"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "Name"
+          KeyType: HASH
+        - AttributeName: "Bucket"
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TableName: "MetadataTable"
+
+  # SQS Queue for Textract polling
+  TextractQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 1209600
+
+  # Metadata Extraction Lambda Function
+  MetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-metadata
+      Runtime: python3.13
+      Handler: src/lambda-extract-metadata.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - "s3:GetObject"
+                - "s3:HeadObject"
+              Resource: !Sub "arn:aws:s3:::${ImageFileBucket}/*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # Update Summary Lambda Function
+  UpdateSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-update-summary
+      Runtime: python3.13
+      Handler: src/lambda-update-summary.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "dynamodb:GetItem"
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # Rekognition Lambda Function
+  RekognitionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-rekognition
+      Runtime: python3.13
+      Handler: src/lambda-rekognition-detect.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - "s3:GetObject"
+              Resource: !Sub "arn:aws:s3:::${ImageFileBucket}/*"
+            - Effect: Allow
+              Action:
+                - "rekognition:DetectLabels"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # Text Extraction Lambda Function
+  TextExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-text-extract
+      Runtime: python3.13
+      Handler: src/lambda-extract-text.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - "s3:GetObject"
+              Resource: !Sub "arn:aws:s3:::${ImageFileBucket}/*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # Textract Lambda Function
+  TextractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-textract
+      Runtime: python3.13
+      Handler: src/lambda-start-detect-document-text-textract.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - "s3:GetObject"
+              Resource: !Sub "arn:aws:s3:::${ImageFileBucket}/*"
+            - Effect: Allow
+              Action:
+                - "textract:StartDocumentTextDetection"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+              Resource: !GetAtt TextractQueue.Arn
+
+  # Textract Poller Lambda Function
+  TextractPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-textract-poller
+      Runtime: python3.13
+      Handler: src/lambda-textract-poller.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref TextractQueue
+          dynamoDBTableName: !Ref DynamoDBTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TextractQueue.Arn
+            BatchSize: 1
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "textract:GetDocumentTextDetection"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+              Resource: !GetAtt TextractQueue.Arn
+            - Effect: Allow
+              Action:
+                - "states:SendTaskSuccess"
+                - "states:SendTaskFailure"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # Comprehend Lambda Function
+  ComprehendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-comprehend
+      Runtime: python3.13
+      Handler: src/lambda-comprehend-summarize.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "comprehend:DetectKeyPhrases"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:GetItem"
+                - "dynamodb:UpdateItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # API Handler Lambda Function
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-api
+      Runtime: python3.13
+      Handler: src/lambda-api-handler.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+          BUCKET_NAME: !Ref ImageFileBucket
+      Events:
+        RootApi:
+          Type: Api
+          Properties:
+            Path: /
+            Method: ANY
+        ProxyApi:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "dynamodb:Scan"
+                - "dynamodb:GetItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+            - Effect: Allow
+              Action:
+                - "s3:PutObject"
+                - "s3:PutObjectAcl"
+                - "s3:GetObject"
+                - "s3:DeleteObject"
+              Resource: !Sub "arn:aws:s3:::${ImageFileBucket}/*"
+            - Effect: Allow
+              Action:
+                - "dynamodb:DeleteItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+
+  # DynamoDB Storage Lambda Function
+  DynamoDBFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: lambda-dynamodb
+      Runtime: python3.13
+      Handler: src/lambda-store-dynamodb.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "dynamodb:PutItem"
+              Resource: !GetAtt DynamoDBTable.Arn
+      Environment:
+        Variables:
+          dynamoDBTableName: !Ref DynamoDBTable
+
+  # Step Functions State Machine
+  TextractStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: document-processing-workflow.asl.json
+      DefinitionSubstitutions:
+        TextractFunction: !GetAtt TextractFunction.Arn
+        TextExtractFunction: !GetAtt TextExtractFunction.Arn
+        ComprehendFunction: !GetAtt ComprehendFunction.Arn
+        DynamoDBFunction: !GetAtt DynamoDBFunction.Arn
+        MetadataFunction: !GetAtt MetadataFunction.Arn
+        UpdateSummaryFunction: !GetAtt UpdateSummaryFunction.Arn
+        RekognitionFunction: !GetAtt RekognitionFunction.Arn
+        SQSQueue: !Ref TextractQueue
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionLogGroup.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - "lambda:InvokeFunction"
+              Resource:
+                - !GetAtt TextractFunction.Arn
+                - !GetAtt TextExtractFunction.Arn
+                - !GetAtt ComprehendFunction.Arn
+                - !GetAtt DynamoDBFunction.Arn
+                - !GetAtt MetadataFunction.Arn
+                - !GetAtt UpdateSummaryFunction.Arn
+                - !GetAtt RekognitionFunction.Arn
+            - Effect: Allow
+              Action:
+                - "sqs:SendMessage"
+              Resource: !GetAtt TextractQueue.Arn
+            - Effect: Allow
+              Action:
+                - "logs:CreateLogDelivery"
+                - "logs:GetLogDelivery"
+                - "logs:UpdateLogDelivery"
+                - "logs:DeleteLogDelivery"
+                - "logs:ListLogDeliveries"
+                - "logs:PutResourcePolicy"
+                - "logs:DescribeResourcePolicies"
+                - "logs:DescribeLogGroups"
+              Resource: "*"
+
+  # CloudWatch Log Group for Step Functions
+  StepFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/stepfunctions/${AWS::StackName}-TextractStateMachine"
+      RetentionInDays: 14
+
+  # EventBridge Rule to trigger Step Functions
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.s3"
+        detail-type:
+          - "Object Created"
+        detail:
+          bucket:
+            name:
+              - !Ref ImageFileBucket
+      Targets:
+        - Arn: !GetAtt TextractStateMachine.Arn
+          Id: "TextractStateMachineTarget"
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              bucket: "$.detail.bucket.name"
+              key: "$.detail.object.key"
+            InputTemplate: |
+              {
+                "bucket": "<bucket>",
+                "key": "<key>"
+              }
+
+  # IAM Role for EventBridge to invoke Step Functions
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !GetAtt TextractStateMachine.Arn
+
+  # CloudWatch Alarms
+  StepFunctionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-StepFunction-Failures"
+      AlarmDescription: "Alert when Step Functions executions fail"
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref TextractStateMachine
+      TreatMissingData: notBreaching
+
+  ApiGatewayErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ApiGateway-Errors"
+      AlarmDescription: "Alert when API Gateway has high error rate"
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${AWS::StackName}-sam-app"
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-Lambda-Errors"
+      AlarmDescription: "Alert when Lambda functions have errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard
+  ProcessingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-DocumentProcessing"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${TextractStateMachine}"],
+                  [".", "ExecutionsFailed", ".", "."],
+                  [".", "ExecutionsStarted", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions - Request Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${TextractStateMachine}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Step Functions - Performance (Avg Duration)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-sam-app"],
+                  [".", "4XXError", ".", "."],
+                  [".", "5XXError", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway - Request Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "${AWS::StackName}-sam-app"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "API Gateway - Performance (Avg Latency)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ApiFunction}"],
+                  [".", "Errors", ".", "."],
+                  [".", "Throttles", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda - Request Metrics (API Function)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ApiFunction}"],
+                  [".", ".", ".", "${TextractFunction}"],
+                  [".", ".", ".", "${ComprehendFunction}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda - Performance (Avg Duration)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${DynamoDBTable}", "Operation", "Scan"],
+                  [".", ".", ".", ".", ".", "GetItem"],
+                  [".", ".", ".", ".", ".", "UpdateItem"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB - Performance (Avg Latency)",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DynamoDBTable}"],
+                  [".", "ConsumedWriteCapacityUnits", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB - Capacity Usage",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ImageFileBucket:
+    Value: !Ref ImageFileBucket
+    Description: S3 Bucket for object storage
+  DynamoDBTable:
+    Value: !Ref DynamoDBTable
+    Description: DynamoDB table containing Textract Results
+  StateMachine:
+    Value: !Ref TextractStateMachine
+    Description: Step Functions State Machine ARN
+  WebsiteURL:
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Description: Website URL
+  ApiURL:
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Description: API Gateway URL
+  DashboardURL:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-DocumentProcessing"
+    Description: CloudWatch Dashboard URL

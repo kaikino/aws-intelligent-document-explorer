@@ -1,0 +1,167 @@
+{
+  "Comment": "Document processing workflow with parallel metadata extraction",
+  "StartAt": "ProcessInParallel",
+  "States": {
+    "ProcessInParallel": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "CheckFileType",
+          "States": {
+            "CheckFileType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Or": [
+                    {"Variable": "$.key", "StringMatches": "*.pdf"},
+                    {"Variable": "$.key", "StringMatches": "*.png"},
+                    {"Variable": "$.key", "StringMatches": "*.jpg"},
+                    {"Variable": "$.key", "StringMatches": "*.jpeg"},
+                    {"Variable": "$.key", "StringMatches": "*.tiff"},
+                    {"Variable": "$.key", "StringMatches": "*.tif"}
+                  ],
+                  "Next": "StartTextract"
+                },
+                {
+                  "Or": [
+                    {"Variable": "$.key", "StringMatches": "*.txt"},
+                    {"Variable": "$.key", "StringMatches": "*.csv"},
+                    {"Variable": "$.key", "StringMatches": "*.json"},
+                    {"Variable": "$.key", "StringMatches": "*.xml"},
+                    {"Variable": "$.key", "StringMatches": "*.log"},
+                    {"Variable": "$.key", "StringMatches": "*.docx"}
+                  ],
+                  "Next": "ExtractPlainText"
+                }
+              ],
+              "Default": "UpdateItem"
+            },
+
+    "StartTextract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextractFunction}",
+        "Payload.$": "$"
+      },
+      "Next": "WaitForTextract"
+    },
+    "WaitForTextract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+      "Parameters": {
+        "QueueUrl": "${SQSQueue}",
+        "MessageBody": {
+          "jobId.$": "$.Payload.jobId",
+          "bucket.$": "$.Payload.bucket",
+          "key.$": "$.Payload.key",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "Next": "CheckTextractOutput"
+    },
+    "CheckTextractOutput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Or": [
+            {"Variable": "$.wordCount", "NumericEquals": 0}
+          ],
+          "Next": "InvokeRekognition"
+        }
+      ],
+      "Default": "CheckWordCount"
+    },
+    "InvokeRekognition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RekognitionFunction}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Next": "CheckWordCount"
+    },
+    "ExtractPlainText": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TextExtractFunction}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Next": "CheckWordCount"
+    },
+
+    "CheckWordCount": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.wordCount",
+          "NumericGreaterThan": 25,
+          "Next": "UpdateItemWithComprehend"
+        }
+      ],
+      "Default": "UpdateItem"
+    },
+    "UpdateItemWithComprehend": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ComprehendFunction}",
+        "Payload.$": "$"
+      },
+      "End": true
+    },
+    "UpdateItem": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${UpdateSummaryFunction}",
+        "Payload": {
+          "bucket.$": "$.bucket",
+          "key.$": "$.key"
+        }
+      },
+      "End": true
+    }
+          }
+        },
+        {
+          "StartAt": "ExtractMetadata",
+          "States": {
+            "ExtractMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${MetadataFunction}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "HandleError"
+        }
+      ],
+      "End": true
+    },
+    "HandleError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DynamoDBFunction}",
+        "Payload": {
+          "summary": "Unprocessed",
+          "error.$": "$.Error",
+          "cause.$": "$.Cause"
+        }
+      },
+      "End": true
+    }
+  }
+}
