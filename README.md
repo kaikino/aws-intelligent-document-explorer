@@ -108,18 +108,6 @@ The deployment includes:
 - API Gateway enforces HTTPS
 - No sensitive data in Step Functions logs
 
-## Cleanup
-
-1. Empty S3 buckets:
-```bash
-aws s3 rm s3://<bucket-name> --recursive
-```
-
-2. Delete the stack:
-```bash
-sam delete
-```
-
 ## Step Functions Workflow
 
 The document processing workflow orchestrates parallel processing with intelligent routing:
@@ -148,11 +136,3 @@ The document processing workflow orchestrates parallel processing with intellige
 **Error Handling**: Any processing failures create "Unprocessed" records for manual retry
 
 **Result**: Every uploaded file gets a DynamoDB record with metadata, extracted text, and AI-generated summary
-
----
-
-**Important**: This application uses various AWS services with associated costs. See the AWS Pricing page for details. You are responsible for any AWS costs incurred.
-
-## License
-
-This project is licensed under the MIT-0 License.
